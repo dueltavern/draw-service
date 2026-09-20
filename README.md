@@ -91,11 +91,15 @@ the card. It also returns per-card coordinates and confidence, since we
 compute them anyway. Credit to HichTala for the pipeline design and for
 training and hosting the underlying models.
 
-## Licensing note
+## Licensing
 
-This service downloads and calls draw2's published models via the Hugging
-Face Hub API rather than depending on its package, but the
-detect/crop/rotate/classify sequence in `detector.py` is a direct
-reimplementation of draw2's own `Draw.process()` method. draw2 is
-AGPL-3.0 - if you deploy this service as part of a network-accessible app,
-review what that license requires for your own distribution.
+This directory is licensed under the **GNU Affero General Public License
+v3.0** (see `LICENSE`), matching draw2's own license. This service downloads
+and calls draw2's published models via the Hugging Face Hub API rather than
+depending on its package, but the detect/crop/rotate/classify sequence in
+`detector.py` is a direct reimplementation of draw2's own `Draw.process()`
+method - a derivative work, which is why this directory carries draw2's
+license rather than the rest of the repo's (see the root README's
+"Licensing" section). If you deploy this service as part of a
+network-accessible app, review what AGPL-3.0 requires for your own
+deployment.
