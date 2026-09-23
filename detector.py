@@ -60,6 +60,21 @@ def _get_txt_box(contour):
     return np.intp(cv2.boxPoints(rect))
 
 
+def _face_down_entry(pts, confidence=0.0):
+    """A card-shaped region YOLO found but the classifier couldn't identify
+    - most commonly an actual face-down card, whose back looks identical
+    across the whole game, but also any card too blurry/occluded to read.
+    Keeping its position (rather than dropping it) lets the client still
+    place it in the right row via the same position-based logic used for
+    Pendulum Monsters, without needing to know what the card actually is."""
+    return {
+        "points": pts.tolist(),
+        "cardId": None,
+        "cardName": "Face-down card",
+        "confidence": confidence,
+    }
+
+
 def _get_rotation(box_wxhxr, box_txt):
     """Ported from draw2's utils.get_rotation - the text box's position
     within the 224x224 crop tells us which of the 4 possible 90-degree
@@ -125,8 +140,13 @@ class CardDetector:
             matches to, mirroring draw2's deck-list filtering.
 
         Returns a list of { points, cardId, cardName, confidence }, one per
-        confidently-classified card. `points` are the 4 detected corners in
-        image_bgr's own pixel coordinates.
+        detected card-shaped region. A card the classifier couldn't
+        confidently identify (most often an actual face-down card, since its
+        back looks the same across the whole game) still gets an entry, with
+        cardId: None and cardName: "Face-down card", rather than being
+        dropped - its position is still real and usable even when its
+        identity isn't. `points` are the 4 detected corners in image_bgr's
+        own pixel coordinates.
         """
         results = self.yolo.predict(
             source=image_bgr, show_labels=False, save=False, device=self.device, verbose=False
@@ -159,6 +179,7 @@ class CardDetector:
             )
             if not contours:
                 rejected_no_contour += 1
+                detections.append(_face_down_entry(pts))
                 continue
 
             contour = max(contours, key=cv2.contourArea)
@@ -194,6 +215,7 @@ class CardDetector:
 
             if best is None or best["score"] < self.confidence_threshold / 100:
                 rejected_low_confidence += 1
+                detections.append(_face_down_entry(pts, best["score"] if best else 0.0))
                 continue
 
             card_id = best["label"].split("-")[-1]
@@ -212,7 +234,7 @@ class CardDetector:
             names = ", ".join(d["cardName"] for d in detections) or "none"
             print(
                 f"[detector] {raw_box_count} raw box(es) -> {len(detections)} detection(s): {names} "
-                f"(rejected: no_contour={rejected_no_contour}, low_confidence={rejected_low_confidence})"
+                f"(unidentified/face-down: no_contour={rejected_no_contour}, low_confidence={rejected_low_confidence})"
             )
 
         return detections
