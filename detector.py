@@ -75,28 +75,6 @@ def _face_down_entry(pts, confidence=0.0):
     }
 
 
-# How close a region's average color needs to be to the configured sleeve
-# color (Euclidean distance in RGB, 0-441 range) to call it a sleeve-back
-# match. Loose enough to tolerate webcam lighting/white-balance drift, tight
-# enough not to casually match a real card's frame color.
-SLEEVE_COLOR_TOLERANCE = 45
-
-
-def _matches_sleeve_color(roi_bgr, sleeve_rgb):
-    """True if roi_bgr's average color is close to sleeve_rgb - a real card's
-    face has enough varied color/art that its average lands far from any one
-    flat color, whereas a solid-colored sleeve back is exactly that flat
-    color on average. Only consulted after classification has already
-    rejected a card as low-confidence (see detect() below) - never used to
-    preempt classification itself, since a real card's average color could
-    plausibly land near a common sleeve color by chance, and that shouldn't
-    be enough on its own to override a confident, correct read."""
-    avg_bgr = roi_bgr.reshape(-1, 3).mean(axis=0)
-    avg_rgb = avg_bgr[::-1]
-    distance = float(np.linalg.norm(avg_rgb - np.array(sleeve_rgb, dtype=np.float64)))
-    return distance <= SLEEVE_COLOR_TOLERANCE
-
-
 def _get_rotation(box_wxhxr, box_txt):
     """Ported from draw2's utils.get_rotation - the text box's position
     within the 224x224 crop tells us which of the 4 possible 90-degree
@@ -155,16 +133,11 @@ class CardDetector:
             device_map=self.device,
         )
 
-    def detect(self, image_bgr, allowed_card_ids=None, sleeve_color=None):
+    def detect(self, image_bgr, allowed_card_ids=None):
         """
         image_bgr: a single OpenCV-style BGR frame.
         allowed_card_ids: optional set of card id strings to restrict
             matches to, mirroring draw2's deck-list filtering.
-        sleeve_color: optional (r, g, b) tuple. Classification always runs
-            first regardless - this is only checked once a card has already
-            been rejected as low-confidence, as extra confirmation it's
-            genuinely a face-down sleeve back rather than just hard to read.
-            It never overrides a confident classification.
 
         Returns a list of { points, cardId, cardName, confidence }, one per
         detected card-shaped region. A card the classifier couldn't
@@ -188,7 +161,6 @@ class CardDetector:
         detections = []
         rejected_no_contour = 0
         rejected_low_confidence = 0
-        rejected_sleeve_match = 0
         for nbox, box in enumerate(result.obb.xyxyxyxyn):
             pts = np.float32(
                 [[p[0] * result.orig_img.shape[1], p[1] * result.orig_img.shape[0]] for p in box.cpu()]
@@ -243,15 +215,6 @@ class CardDetector:
 
             if best is None or best["score"] < self.confidence_threshold / 100:
                 rejected_low_confidence += 1
-                # Sleeve color is only consulted here, after classification
-                # has already had its shot - never used to preempt a
-                # confident, correct read of a real card. When a sleeve
-                # color is configured and the region matches it, that's
-                # extra confirmation this is genuinely a face-down card
-                # rather than just a hard-to-read one - logged for now,
-                # doesn't change the outcome (already face-down either way).
-                if sleeve_color is not None:
-                    rejected_sleeve_match += int(_matches_sleeve_color(roi, sleeve_color))
                 detections.append(_face_down_entry(pts, best["score"] if best else 0.0))
                 continue
 
@@ -271,8 +234,7 @@ class CardDetector:
             names = ", ".join(d["cardName"] for d in detections) or "none"
             print(
                 f"[detector] {raw_box_count} raw box(es) -> {len(detections)} detection(s): {names} "
-                f"(unidentified/face-down: no_contour={rejected_no_contour}, "
-                f"low_confidence={rejected_low_confidence}, of which sleeve_color_confirmed={rejected_sleeve_match})"
+                f"(unidentified/face-down: no_contour={rejected_no_contour}, low_confidence={rejected_low_confidence})"
             )
 
         return detections
