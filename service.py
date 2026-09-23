@@ -32,6 +32,17 @@ app = FastAPI(lifespan=lifespan)
 class DetectRequest(BaseModel):
     imageBase64: str
     allowedCardIds: list[str] | None = None
+    sleeveColor: str | None = None  # "#rrggbb" - the player's own sleeve color, if they've set one
+
+
+def _parse_hex_color(hex_str: str) -> tuple[int, int, int] | None:
+    hex_str = hex_str.lstrip("#")
+    if len(hex_str) != 6:
+        return None
+    try:
+        return tuple(int(hex_str[i : i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
 
 
 @app.post("/detect")
@@ -43,7 +54,8 @@ def detect(req: DetectRequest):
         return {"detections": []}
 
     allowed = set(req.allowedCardIds) if req.allowedCardIds else None
-    return {"detections": detector.detect(image_bgr, allowed_card_ids=allowed)}
+    sleeve_color = _parse_hex_color(req.sleeveColor) if req.sleeveColor else None
+    return {"detections": detector.detect(image_bgr, allowed_card_ids=allowed, sleeve_color=sleeve_color)}
 
 
 @app.get("/health")
