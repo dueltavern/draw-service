@@ -65,8 +65,8 @@ def _face_down_entry(pts, confidence=0.0):
     - most commonly an actual face-down card, whose back looks identical
     across the whole game, but also any card too blurry/occluded to read.
     Keeping its position (rather than dropping it) lets the client still
-    place it in the right row via the same position-based logic used for
-    Pendulum Monsters, without needing to know what the card actually is."""
+    place it in the right row via the same position-based grouping used for
+    every other card, without needing to know what the card actually is."""
     return {
         "points": pts.tolist(),
         "cardId": None,
@@ -133,6 +133,18 @@ class CardDetector:
             device_map=self.device,
         )
 
+    def _classify(self, oriented_rois, allowed_card_ids):
+        """Classifies a batch of upright 224x224 crops in one pipeline call
+        and returns the best candidate for each (None where nothing passes
+        allowed_card_ids)."""
+        pil_rois = [Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)) for roi in oriented_rois]
+        best = []
+        for output in self.classifier(pil_rois, top_k=15, batch_size=len(pil_rois)):
+            if allowed_card_ids:
+                output = [c for c in output if c["label"].split("-")[-1] in allowed_card_ids]
+            best.append(output[0] if output else None)
+        return best
+
     def detect(self, image_bgr, allowed_card_ids=None):
         """
         image_bgr: a single OpenCV-style BGR frame.
@@ -186,30 +198,24 @@ class CardDetector:
             box_txt = _get_txt_box(contour)
             rotation = _get_rotation(result.obb.xywhr[nbox], box_txt)
 
-            def classify(oriented_roi):
-                pil_roi = Image.fromarray(cv2.cvtColor(oriented_roi, cv2.COLOR_BGR2RGB))
-                output = self.classifier(pil_roi, top_k=15)
-                if allowed_card_ids:
-                    for candidate in output:
-                        if candidate["label"].split("-")[-1] in allowed_card_ids:
-                            return candidate
-                    return None
-                return output[0]
-
             if rotation is not None:
                 oriented = roi if rotation == 0 else cv2.rotate(roi, rotation)
-                best = classify(oriented)
+                best = self._classify([oriented], allowed_card_ids)[0]
             else:
                 # draw2's own rotation heuristic couldn't decide - rather
                 # than dropping this card (and, in the real Draw.process(),
                 # every OTHER card in the frame too), try all 4 orientations
-                # and keep whichever the classifier is most confident about.
-                candidates = [
-                    classify(roi),
-                    classify(cv2.rotate(roi, cv2.ROTATE_90_CLOCKWISE)),
-                    classify(cv2.rotate(roi, cv2.ROTATE_180)),
-                    classify(cv2.rotate(roi, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-                ]
+                # (as one batch) and keep whichever the classifier is most
+                # confident about.
+                candidates = self._classify(
+                    [
+                        roi,
+                        cv2.rotate(roi, cv2.ROTATE_90_CLOCKWISE),
+                        cv2.rotate(roi, cv2.ROTATE_180),
+                        cv2.rotate(roi, cv2.ROTATE_90_COUNTERCLOCKWISE),
+                    ],
+                    allowed_card_ids,
+                )
                 candidates = [c for c in candidates if c is not None]
                 best = max(candidates, key=lambda c: c["score"]) if candidates else None
 
