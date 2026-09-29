@@ -1,7 +1,7 @@
 [project]
 name = "draw-service"
 version = "0.1.0"
-description = "FastAPI wrapper around draw2's card detection/recognition models for Duel Board"
+description = "FastAPI wrapper around draw2's card detection/recognition models for Duel Tavern"
 requires-python = ">=3.9"
 dependencies = [
     "fastapi",
