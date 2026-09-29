@@ -1,7 +1,7 @@
 # draw-service
 
 A small FastAPI wrapper around the detection + recognition models from
-[draw2](https://github.com/HichTala/draw2) (AGPL-3.0), used by Duel Board's
+[draw2](https://github.com/HichTala/draw2) (AGPL-3.0), used by Duel Tavern's
 card scanning instead of the client-side CV heuristic + CLIP embedding
 matching this project used previously.
 
