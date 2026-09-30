@@ -36,6 +36,7 @@ from ultralytics import YOLO
 
 DEFAULT_CONFIDENCE_THRESHOLD = 5  # percent, matches draw2's own default
 
+
 # Logs per-candidate pass/reject reasoning and a per-frame summary - handy
 # when diagnosing why a real board's cards aren't (or are) coming through.
 DETECTION_LOGGING = True
@@ -73,6 +74,79 @@ def _face_down_entry(pts, confidence=0.0):
         "cardName": "Face-down card",
         "confidence": confidence,
     }
+
+
+def _card_long_side(pts):
+    return max(float(np.linalg.norm(np.subtract(pts[(i + 1) % 4], pts[i]))) for i in range(4))
+
+
+def _find_card_backs(image_bgr, face_up_points):
+    """Face-down cards the YOLO model doesn't detect at all - it learned card
+    *faces*, and doesn't register a plain card back or a plain sleeve even
+    at 0.5% confidence. Both are easy to spot without it, though, as a solid
+    block of one kind of color the size of the other cards on the table:
+    - unsleeved backs: very dark (the black swirl). The swirl is inset from
+      the card's edges, so the corners are scaled out to cover the card.
+    - light sleeves (white, cream, grey): nearly colorless and very bright,
+      unlike a wooden table or a card face. A sleeve covers the whole card.
+
+    For each, pixels of that kind are closed up into blobs, and a blob's
+    minimum-area rectangle must be mostly filled (a solid card, not a shadow
+    or the gaps in a keyboard), roughly card-proportioned (loosely - a camera
+    looking at the table at an angle makes an upright card look squarer and
+    a sideways one wider), card-sized (compared to the face-up cards when
+    there are any, otherwise to the frame) and not sitting on a card YOLO
+    already found."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    kinds = [
+        (cv2.inRange(hsv, (0, 0, 0), (180, 255, CARD_BACK_MAX_BRIGHTNESS)), CARD_BACK_EDGE_SCALE),
+        (cv2.inRange(hsv, (0, 0, LIGHT_SLEEVE_MIN_BRIGHTNESS), (180, LIGHT_SLEEVE_MAX_SATURATION, 255)), 1.0),
+    ]
+    found = []
+    for mask, edge_scale in kinds:
+        found += _card_shaped_blobs(mask, edge_scale, image_bgr.shape[0], face_up_points, found)
+    return found
+
+
+def _card_shaped_blobs(mask, edge_scale, frame_h, face_up_points, already_found):
+    typical = float(np.median([_card_long_side(p) for p in face_up_points])) if face_up_points else None
+    taken = list(face_up_points) + list(already_found)
+    k = max(3, int((typical or frame_h * 0.24) * 0.06)) | 1
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    blobs = []
+    for contour in contours:
+        (cx, cy), (w, h), angle = cv2.minAreaRect(contour)
+        if min(w, h) < 10:
+            continue
+        long_side, short_side = max(w, h), min(w, h)
+        card_long = long_side * edge_scale
+        size_ok = (0.55 < card_long / typical < 1.5) if typical else (0.1 < card_long / frame_h < 0.5)
+        area = cv2.contourArea(contour)
+        # A camera looking down at an angle sees a card as a trapezoid, which
+        # fills less of its rectangle - so the fill check is loose, and it's
+        # solidity (no big dents - a shadow or a hand has them) that keeps
+        # irregular blobs out.
+        fill = area / (w * h)
+        solidity = area / max(cv2.contourArea(cv2.convexHull(contour)), 1)
+        if not (1.0 <= long_side / short_side < 2.2 and fill > 0.75 and solidity > 0.9 and size_ok):
+            continue
+        if any(cv2.pointPolygonTest(np.float32(p), (cx, cy), False) >= 0 for p in taken):
+            continue
+        blobs.append(np.float32(cv2.boxPoints(((cx, cy), (w * edge_scale, h * edge_scale), angle))))
+    return blobs
+
+
+# Card backs: how dark (HSV value, 0-255) a pixel has to be to count as the
+# swirl, and how much bigger the whole card is than that dark area.
+CARD_BACK_MAX_BRIGHTNESS = 90
+CARD_BACK_EDGE_SCALE = 1.1
+# Light sleeves: how bright (HSV value) and how colorless (HSV saturation,
+# 0-255) a pixel has to be. A wooden table sits around saturation 120.
+LIGHT_SLEEVE_MIN_BRIGHTNESS = 200
+LIGHT_SLEEVE_MAX_SATURATION = 70
 
 
 def _get_rotation(box_wxhxr, box_txt):
@@ -161,12 +235,18 @@ class CardDetector:
         own pixel coordinates.
         """
         results = self.yolo.predict(
-            source=image_bgr, show_labels=False, save=False, device=self.device, verbose=False
+            source=image_bgr,
+            show_labels=False,
+            save=False,
+            device=self.device,
+            verbose=False,
         )
         if not results or results[0].obb is None:
+            # No face-up cards - but there can still be face-down ones.
+            card_backs = [_face_down_entry(pts) for pts in _find_card_backs(image_bgr, [])]
             if DETECTION_LOGGING:
-                print("[detector] YOLO found no boxes in this frame")
-            return []
+                print(f"[detector] YOLO found no boxes in this frame; card_backs={len(card_backs)}")
+            return card_backs
         result = results[0]
         raw_box_count = len(result.obb.xyxyxyxyn)
 
@@ -236,11 +316,15 @@ class CardDetector:
                 }
             )
 
+        card_backs = _find_card_backs(image_bgr, [d["points"] for d in detections])
+        detections.extend(_face_down_entry(pts) for pts in card_backs)
+
         if DETECTION_LOGGING:
             names = ", ".join(d["cardName"] for d in detections) or "none"
             print(
                 f"[detector] {raw_box_count} raw box(es) -> {len(detections)} detection(s): {names} "
-                f"(unidentified/face-down: no_contour={rejected_no_contour}, low_confidence={rejected_low_confidence})"
+                f"(unidentified/face-down: no_contour={rejected_no_contour}, low_confidence={rejected_low_confidence}, "
+                f"card_backs={len(card_backs)})"
             )
 
         return detections
