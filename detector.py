@@ -2,6 +2,10 @@
 Card detection + recognition, using the same YOLO detector and image
 classifier as HichTala/draw2 (https://github.com/HichTala/draw2, AGPL-3.0).
 
+Modified from draw2's Draw.process() and utils.get_rotation by the Duel
+Tavern contributors, first on 2026-09-19 and since; see the git history of
+this file for each change.
+
 This is a reimplementation, not a use of draw2's own Draw class: Draw locks
 in a single video/image source at construction time (`self.results` is a
 generator over that one source) and reloads both models from scratch on
