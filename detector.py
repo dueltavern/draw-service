@@ -39,11 +39,10 @@ from transformers import AutoImageProcessor, pipeline
 from ultralytics import YOLO
 
 DEFAULT_CONFIDENCE_THRESHOLD = 5  # percent, matches draw2's own default
-
-
-# Logs per-candidate pass/reject reasoning and a per-frame summary - handy
-# when diagnosing why a real board's cards aren't (or are) coming through.
 DETECTION_LOGGING = True
+CLASSIFY_BATCH_SIZE = 32
+WARP_CORNERS = np.float32([[224, 224], [224, 0], [0, 0], [0, 224]])
+ALL_ROTATIONS = [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE]
 
 
 def _extract_contours(roi, d, sigma_color, sigma_space, thresh):
@@ -66,12 +65,6 @@ def _get_txt_box(contour):
 
 
 def _face_down_entry(pts, confidence=0.0):
-    """A card-shaped region YOLO found but the classifier couldn't identify
-    - most commonly an actual face-down card, whose back looks identical
-    across the whole game, but also any card too blurry/occluded to read.
-    Keeping its position (rather than dropping it) lets the client still
-    place it in the right row via the same position-based grouping used for
-    every other card, without needing to know what the card actually is."""
     return {
         "points": pts.tolist(),
         "cardId": None,
@@ -186,8 +179,6 @@ def _get_rotation(box_wxhxr, box_txt):
 
 
 class CardDetector:
-    """Loads models once; call detect() per frame after that."""
-
     def __init__(self, confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.confidence_threshold = confidence_threshold
@@ -211,32 +202,29 @@ class CardDetector:
             device_map=self.device,
         )
 
-    def _classify(self, oriented_rois, allowed_card_ids):
-        """Classifies a batch of upright 224x224 crops in one pipeline call
-        and returns the best candidate for each (None where nothing passes
-        allowed_card_ids)."""
-        pil_rois = [Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)) for roi in oriented_rois]
+    def _classify(self, rois, allowed_card_ids):
+        """Best candidate for each upright 224x224 crop (None where nothing
+        passes allowed_card_ids), in batches through the pipeline."""
+        pil_rois = [Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)) for roi in rois]
         best = []
-        for output in self.classifier(pil_rois, top_k=15, batch_size=len(pil_rois)):
-            if allowed_card_ids:
-                output = [c for c in output if c["label"].split("-")[-1] in allowed_card_ids]
-            best.append(output[0] if output else None)
+        for i in range(0, len(pil_rois), CLASSIFY_BATCH_SIZE):
+            chunk = pil_rois[i : i + CLASSIFY_BATCH_SIZE]
+            for output in self.classifier(chunk, top_k=15, batch_size=len(chunk)):
+                if allowed_card_ids:
+                    output = [c for c in output if c["label"].split("-")[-1] in allowed_card_ids]
+                best.append(output[0] if output else None)
         return best
 
     def detect(self, image_bgr, allowed_card_ids=None):
         """
-        image_bgr: a single OpenCV-style BGR frame.
-        allowed_card_ids: optional set of card id strings to restrict
-            matches to, mirroring draw2's deck-list filtering.
-
         Returns a list of { points, cardId, cardName, confidence }, one per
-        detected card-shaped region. A card the classifier couldn't
-        confidently identify (most often an actual face-down card, since its
-        back looks the same across the whole game) still gets an entry, with
-        cardId: None and cardName: "Face-down card", rather than being
-        dropped - its position is still real and usable even when its
-        identity isn't. `points` are the 4 detected corners in image_bgr's
-        own pixel coordinates.
+        detected card-shaped region, with `points` the 4 corners in
+        image_bgr's pixel coordinates. A card the classifier can't identify
+        (most often face-down) still gets an entry, with cardId None.
+
+        Every card's crops are classified together in one pass: one crop
+        for a card whose orientation the text-box heuristic settled, all 4
+        rotations (best score wins) for one it couldn't.
         """
         results = self.yolo.predict(
             source=image_bgr,
@@ -246,24 +234,20 @@ class CardDetector:
             verbose=False,
         )
         if not results or results[0].obb is None:
-            # No face-up cards - but there can still be face-down ones.
             card_backs = [_face_down_entry(pts) for pts in _find_card_backs(image_bgr, [])]
             if DETECTION_LOGGING:
                 print(f"[detector] YOLO found no boxes in this frame; card_backs={len(card_backs)}")
             return card_backs
         result = results[0]
         raw_box_count = len(result.obb.xyxyxyxyn)
+        frame_h, frame_w = result.orig_img.shape[:2]
 
         detections = []
+        pending = []  # (index in detections, pts, crops)
         rejected_no_contour = 0
-        rejected_low_confidence = 0
         for nbox, box in enumerate(result.obb.xyxyxyxyn):
-            pts = np.float32(
-                [[p[0] * result.orig_img.shape[1], p[1] * result.orig_img.shape[0]] for p in box.cpu()]
-            )
-
-            dst = np.float32([[224, 224], [224, 0], [0, 0], [0, 224]])
-            transform = cv2.getPerspectiveTransform(pts, dst)
+            pts = np.float32([[p[0] * frame_w, p[1] * frame_h] for p in box.cpu()])
+            transform = cv2.getPerspectiveTransform(pts, WARP_CORNERS)
             roi = cv2.warpPerspective(image_bgr, transform, (224, 224), flags=cv2.INTER_LINEAR)
 
             contours = _extract_contours(
@@ -278,47 +262,31 @@ class CardDetector:
                 detections.append(_face_down_entry(pts))
                 continue
 
-            contour = max(contours, key=cv2.contourArea)
-            box_txt = _get_txt_box(contour)
+            box_txt = _get_txt_box(max(contours, key=cv2.contourArea))
             rotation = _get_rotation(result.obb.xywhr[nbox], box_txt)
-
-            if rotation is not None:
-                oriented = roi if rotation == 0 else cv2.rotate(roi, rotation)
-                best = self._classify([oriented], allowed_card_ids)[0]
+            if rotation is None:
+                crops = [roi] + [cv2.rotate(roi, r) for r in ALL_ROTATIONS]
             else:
-                # draw2's own rotation heuristic couldn't decide - rather
-                # than dropping this card (and, in the real Draw.process(),
-                # every OTHER card in the frame too), try all 4 orientations
-                # (as one batch) and keep whichever the classifier is most
-                # confident about.
-                candidates = self._classify(
-                    [
-                        roi,
-                        cv2.rotate(roi, cv2.ROTATE_90_CLOCKWISE),
-                        cv2.rotate(roi, cv2.ROTATE_180),
-                        cv2.rotate(roi, cv2.ROTATE_90_COUNTERCLOCKWISE),
-                    ],
-                    allowed_card_ids,
-                )
-                candidates = [c for c in candidates if c is not None]
-                best = max(candidates, key=lambda c: c["score"]) if candidates else None
+                crops = [roi if rotation == 0 else cv2.rotate(roi, rotation)]
+            pending.append((len(detections), pts, crops))
+            detections.append(None)
 
+        classified = iter(self._classify([crop for _, _, crops in pending for crop in crops], allowed_card_ids))
+        rejected_low_confidence = 0
+        for index, pts, crops in pending:
+            candidates = [c for c in (next(classified) for _ in crops) if c is not None]
+            best = max(candidates, key=lambda c: c["score"]) if candidates else None
             if best is None or best["score"] < self.confidence_threshold / 100:
                 rejected_low_confidence += 1
-                detections.append(_face_down_entry(pts, best["score"] if best else 0.0))
+                detections[index] = _face_down_entry(pts, best["score"] if best else 0.0)
                 continue
-
             card_id = best["label"].split("-")[-1]
-            card_name = self.cardnames.get(card_id, {}).get("EN") or "-".join(best["label"].split("-")[:-1])
-
-            detections.append(
-                {
-                    "points": pts.tolist(),
-                    "cardId": card_id,
-                    "cardName": card_name,
-                    "confidence": best["score"],
-                }
-            )
+            detections[index] = {
+                "points": pts.tolist(),
+                "cardId": card_id,
+                "cardName": self.cardnames.get(card_id, {}).get("EN") or "-".join(best["label"].split("-")[:-1]),
+                "confidence": best["score"],
+            }
 
         card_backs = _find_card_backs(image_bgr, [d["points"] for d in detections])
         detections.extend(_face_down_entry(pts) for pts in card_backs)

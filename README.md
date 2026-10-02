@@ -1,33 +1,23 @@
 # draw-service
 
-A small FastAPI wrapper around the detection + recognition models from
-[draw2](https://github.com/HichTala/draw2) (AGPL-3.0), used by Duel Tavern's
-card scanning instead of the client-side CV heuristic + CLIP embedding
-matching this project used previously.
-
-It's a separate Python process from `server/` (Node) and `client/` (Vite) -
-run all three side by side during development.
+The card detection and recognition service behind
+[Duel Tavern](https://github.com/dueltavern), built on the models from
+[draw2](https://github.com/HichTala/draw2) by HichTala. Given a photo of a
+Yu-Gi-Oh! board, it returns every card it finds, with its position and,
+when it can tell, which card it is.
 
 ## Setup
 
 ```bash
-cd draw-service
 uv sync
+uv run uvicorn service:app --host 0.0.0.0 --port 8008
 ```
 
 Without uv: `pip install fastapi "uvicorn[standard]" pydantic ultralytics transformers accelerate huggingface_hub opencv-python-headless pillow torch numpy`.
 
-## Running
-
-```bash
-uv run uvicorn service:app --host 0.0.0.0 --port 8008
-```
-
-First request after starting downloads the YOLO detector and card
-classifier from Hugging Face (a few hundred MB+) and caches them locally -
-this can take a while and needs a working internet connection the first
-time. A GPU (CUDA) is used automatically if available; otherwise it runs on
-CPU, which will be noticeably slower per scan.
+The first start downloads the YOLO detector and the card classifier from
+Hugging Face (several hundred MB) and caches them. A CUDA GPU is used when
+available; on CPU each scan is noticeably slower.
 
 ## API
 
@@ -37,68 +27,56 @@ CPU, which will be noticeably slower per scan.
 { "imageBase64": "data:image/jpeg;base64,...", "allowedCardIds": ["46986414"] }
 ```
 
-`allowedCardIds` is optional - when given, only detections matching one of
-those card IDs are returned (mirrors draw2's own deck-list filtering,
-without needing a `.ydk` file).
-
-Response:
+`allowedCardIds` is optional and limits recognition to those cards.
 
 ```json
 {
   "detections": [
-    { "points": [[x, y], [x, y], [x, y], [x, y]], "cardId": "46986414", "cardName": "Dark Magician", "confidence": 0.94 }
+    { "points": [[x, y], [x, y], [x, y], [x, y]], "cardId": "46986414", "cardName": "Dark Magician", "confidence": 0.94 },
+    { "points": [[x, y], [x, y], [x, y], [x, y]], "cardId": null, "cardName": "Face-down card", "confidence": 0.0 }
   ]
 }
 ```
 
-`GET /health` returns `{ "ready": true }` once models have finished loading.
+`points` are the card's four corners in image pixels. A card that was found
+but couldn't be identified (usually a face-down card) has `cardId: null`.
 
-Set `DETECTION_LOGGING = True/False` at the top of `detector.py` to toggle
-per-candidate pass/reject logging - useful when a real board's cards aren't
-coming through and you want to see whether YOLO found them at all versus
-the classifier rejecting them.
+`GET /health` returns `{ "ready": true }` once the models are loaded.
 
-## Why this isn't just draw2's own `Draw` class
+### Debugging
 
-An earlier version of this service depended on and called draw2's `Draw`
-class directly, via its public API, rather than reimplementing its
-pipeline. That turned out to have real problems once tested against actual
-model weights, not just code review:
+- `DETECTION_LOGGING` at the top of `detector.py` logs a summary of every
+  frame: boxes found, cards identified, and why the rest weren't.
+- Setting `DRAW_SAVE_FRAMES=<folder>` saves every scanned frame with its
+  detections, to inspect later.
 
-- **`Draw.__init__` reloads both models from scratch on every construction.**
-  It's designed to own one fixed video/image source for its whole lifetime,
-  not to be built once and reused - so calling it fresh per scan (the only
-  way to use its public API for discrete requests) pays the full model-load
-  cost every time, not just inference time.
-- **A single ambiguous card blanks out the whole frame's results.**
-  `Draw.process()`'s per-card loop uses `break` (not `continue`) when its
-  rotation heuristic can't confidently orient one of the detected cards - so
-  one bad card silently drops every other card detected in that same frame
-  too. Confirmed directly: a 7-card board scan returned zero results despite
-  YOLO detecting cards, purely because of this.
-- **No per-card coordinates or confidence scores.** `process()` only returns
-  classified label strings, so a scan couldn't be matched to a specific
-  clicked card when several were in frame, and there was no way to draw a
-  detection outline.
+## How it works
 
-`detector.py` instead loads both models once at service startup and exposes
-a plain `detect()` call, following the same detect → perspective-warp →
-rotate → classify sequence as draw2's own `Draw.process()` (that sequence is
-what makes the models' raw output usable at all), but with `continue`
-instead of `break`, and a fallback that tries all 4 orientations through the
-classifier when the rotation heuristic can't decide - instead of dropping
-the card. It also returns per-card coordinates and confidence, since we
-compute them anyway. Credit to HichTala for the pipeline design and for
-training and hosting the underlying models.
+For each frame, `detector.py`:
+
+1. Finds card-shaped regions with draw2's YOLO oriented-box detector.
+2. Warps each region to a square-on 224×224 crop.
+3. Works out which way up the card is from where its text box sits (draw2's
+   rotation heuristic).
+4. Identifies every card with draw2's image classifier, all in one batch. A
+   card whose orientation couldn't be settled is tried in all four
+   rotations, and the most confident reading is kept.
+5. Keeps cards it can't identify as face-down entries, and finds plain card
+   backs and light-colored sleeves, which the detector doesn't see, by color.
+
+### Differences from draw2's `Draw` class
+
+draw2's `Draw` is built for one continuous video source: it reloads both
+models on every construction, and its `process()` stops at the first card it
+can't orient (`break` instead of `continue`), dropping every other card in
+the frame. It also returns only labels. This service loads the models once,
+handles each frame independently, never drops a card, and returns positions
+and confidence for each one.
 
 ## Licensing
 
-This service is licensed under the **GNU Affero General Public License
-v3.0** (see `LICENSE`), matching draw2's own license. It downloads and calls
-draw2's published models via the Hugging Face Hub API rather than depending
-on its package, but the detect/crop/rotate/classify sequence in
-`detector.py` is a direct reimplementation of draw2's own `Draw.process()`
-method - a derivative work under the same license. This repository is the
-corresponding source for the card recognition running on Duel Tavern. If
-you deploy this service as part of a network-accessible app, review what
-AGPL-3.0 requires for your own deployment.
+Licensed under the **GNU Affero General Public License v3.0** (see
+`LICENSE`), like draw2. `detector.py` reimplements and modifies draw2's
+`Draw.process()` and `get_rotation`. This repository is the corresponding
+source for the card recognition running in Duel Tavern. Credit to HichTala
+for the pipeline design and for training and hosting the models.

@@ -1,10 +1,4 @@
-"""
-HTTP wrapper around CardDetector, so the Node server can call it over the
-network instead of needing Python in-process. Models load once at startup;
-each request after that is just inference.
-
-Run with: uvicorn service:app --host 0.0.0.0 --port 8008
-"""
+"""HTTP wrapper around CardDetector. Run with: uvicorn service:app --host 0.0.0.0 --port 8008"""
 
 import base64
 import json
@@ -22,11 +16,7 @@ from detector import CardDetector
 
 detector: CardDetector | None = None
 
-# Diagnostic switch: set DRAW_SAVE_FRAMES to a folder path and every scanned
-# frame is saved there (as a .jpg), next to what was detected in it (a .json
-# with the same name) - for checking offline why a card was or wasn't read.
-# Off unless set. Example:
-#   DRAW_SAVE_FRAMES=frames uv run uvicorn service:app --host 0.0.0.0 --port 8008
+# Set to a folder to save every scanned frame (.jpg) next to its detections (.json).
 SAVE_FRAMES_DIR = os.environ.get("DRAW_SAVE_FRAMES")
 
 
